@@ -6,8 +6,8 @@
 
 //tunable constants
 #define CACHE_LINE   64      /* bytes; probes must sit on separate lines. WHY 64? */
-#define NUM_SAMPLES  100000  /* repetitions for the calibration histogram */
-#define THRESHOLD 100 //placeholder until tested, smaller than flush + reload time
+#define NUM_SAMPLES  10000  /* repetitions for the calibration histogram */
+#define THRESHOLD 48 //calibration threshold. Change for each machine
 
 /* rdtsc_start(): read the timestamp counter to OPEN a timing window.
  * Return: the 64-bit counter value (combine the two 32-bit halves). */
