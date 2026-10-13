@@ -48,44 +48,25 @@ def print_stats(name, data):
 
 def find_best_threshold(hits, misses):
     """
-    Scan EVERY integer cycle count between the two distributions and find the
-    threshold that misclassifies the fewest samples.
-
     Flush+Flush expectation: hit (cached) flushes are SLOWER than miss (evicted)
     flushes, because clflush has real eviction work to do on a cached line.
     So the decision rule is: cycles > THRESHOLD  => treat as "hit" (was cached).
-
-    NOTE: we deliberately do NOT use np.linspace(lo, hi, N) with a fixed N here.
-    Outlier samples (e.g. a context switch landing mid-measurement) can push
-    hi way out (into the tens of thousands of cycles) while the real hit/miss
-    crossover lives in a tiny window just above the noise floor. A fixed-N
-    linspace over the full lo..hi range would make each step many cycles wide
-    and could skip straight over that crossover window, picking a useless
-    threshold. Scanning every integer cycle count avoids that entirely.
     """
     sorted_hits = np.sort(hits)              # hits sorted ascending, needed for searchsorted
     sorted_misses = np.sort(misses)          # misses sorted ascending, needed for searchsorted
 
-    lo = min(misses.min(), hits.min())       # lowest cycle count seen across both sets
-    hi = max(misses.max(), hits.max())       # highest cycle count seen across both sets
-    candidates = np.arange(lo, hi + 1)       # every integer cycle count from lo to hi, inclusive
+    hit_median = np.median(hits)             # middle value of the hit class
+    miss_median = np.median(misses)          # middle value of the miss class
+    best_t = (hit_median + miss_median) / 2.0   # the midpoint between the two medians
 
-    # for each candidate threshold t, count hits <= t (false "miss" calls)
-    # searchsorted(..., side="right") gives the count of elements <= t in one vectorized call
-    false_miss = np.searchsorted(sorted_hits, candidates, side="right")
+    # count hits <= best_t (false "miss" calls) and misses > best_t (false "hit" calls),
+    # same bookkeeping as before, just evaluated at this ONE threshold instead of a scan
+    false_miss = np.searchsorted(sorted_hits, best_t, side="right")
+    false_hit = len(sorted_misses) - np.searchsorted(sorted_misses, best_t, side="right")
 
-    # for each candidate threshold t, count misses > t (false "hit" calls)
-    # total misses minus the count of misses <= t
-    false_hit = len(sorted_misses) - np.searchsorted(sorted_misses, candidates, side="right")
-
-    err = false_miss + false_hit             # total misclassified samples at each candidate threshold
-    best_idx = np.argmin(err)                # index of the candidate with the fewest misclassifications
-
-    best_t = candidates[best_idx]            # the winning threshold value
-    best_err = err[best_idx]                 # the misclassification count at that threshold
-
+    best_err = false_miss + false_hit        # total misclassified samples at this threshold
     total = len(hits) + len(misses)          # total number of samples across both sets
-    return best_t, best_err, total            # hand back the winning threshold and its error rate
+    return best_t, best_err, total            # hand back the median-midpoint threshold and its error rate
 
 
 def main():
@@ -112,9 +93,9 @@ def main():
     else:
         print("no overlap between hit and miss distributions (clean separation)")  # best case
 
-    best_t, best_err, total = find_best_threshold(hits, misses)  # compute the best threshold
+    best_t, best_err, total = find_best_threshold(hits, misses)  # compute the median-midpoint threshold
     print()
-    print(f"suggested THRESHOLD = {int(best_t)}")                 # print the recommended threshold
+    print(f"suggested THRESHOLD = {best_t:.1f} (midpoint of hit/miss medians)")  # print the recommended threshold
     print(f"misclassified at that threshold: {best_err} / {total} "
           f"({100.0 * best_err / total:.2f}%)")                   # print how good that threshold is
 
