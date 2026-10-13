@@ -16,4 +16,4 @@ Challenges of Reverse Engineering Cache, Future of Cache Organization, and End o
 # Build and Run Attack
 ```gcc -O0 -0 <attack> <attack.c> ``` \
 ```tasket -c <core> ./<attack> attack``` \
-```taskset -c <core> ./flush_flush measure > <machine>_calib.csv 2> <machine>_measure_summary.txt```
+```taskset -c <core> ./flush_flush measure > <machine>_measure_data.csv 2> <machine>_measure_summary.txt```
