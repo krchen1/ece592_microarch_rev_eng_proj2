@@ -1,0 +1,10 @@
+run 0 summary: accuracy=0.90% fn_rate=86.58% fp_rate=19.60% trials_per_sec=314436.2 bits_per_sec=11319.7 control_line_violations=65/1000 setup_cycles=165255 mem_bytes=69632 wall_sec=0.0318
+run 1 summary: accuracy=1.02% fn_rate=82.74% fp_rate=2.60% trials_per_sec=275993.5 bits_per_sec=11260.5 control_line_violations=4/1000 setup_cycles=165255 mem_bytes=69632 wall_sec=0.0362
+run 2 summary: accuracy=0.29% fn_rate=96.37% fp_rate=0.70% trials_per_sec=330247.3 bits_per_sec=3830.9 control_line_violations=1/1000 setup_cycles=165255 mem_bytes=69632 wall_sec=0.0303
+run 3 summary: accuracy=0.03% fn_rate=99.25% fp_rate=0.60% trials_per_sec=350826.7 bits_per_sec=421.0 control_line_violations=2/1000 setup_cycles=165255 mem_bytes=69632 wall_sec=0.0285
+run 4 summary: accuracy=0.33% fn_rate=94.75% fp_rate=0.20% trials_per_sec=316610.7 bits_per_sec=4179.3 control_line_violations=2/1000 setup_cycles=165255 mem_bytes=69632 wall_sec=0.0316
+run 5 summary: accuracy=0.02% fn_rate=99.79% fp_rate=0.00% trials_per_sec=351251.2 bits_per_sec=281.0 control_line_violations=0/1000 setup_cycles=165255 mem_bytes=69632 wall_sec=0.0285
+run 6 summary: accuracy=0.03% fn_rate=99.86% fp_rate=0.20% trials_per_sec=354840.0 bits_per_sec=425.8 control_line_violations=1/1000 setup_cycles=165255 mem_bytes=69632 wall_sec=0.0282
+run 7 summary: accuracy=0.02% fn_rate=99.84% fp_rate=0.30% trials_per_sec=354225.0 bits_per_sec=283.4 control_line_violations=3/1000 setup_cycles=165255 mem_bytes=69632 wall_sec=0.0282
+run 8 summary: accuracy=0.47% fn_rate=93.38% fp_rate=0.00% trials_per_sec=314013.3 bits_per_sec=5903.4 control_line_violations=0/1000 setup_cycles=165255 mem_bytes=69632 wall_sec=0.0318
+run 9 summary: accuracy=0.03% fn_rate=99.77% fp_rate=0.40% trials_per_sec=352587.4 bits_per_sec=423.1 control_line_violations=2/1000 setup_cycles=165255 mem_bytes=69632 wall_sec=0.0284
