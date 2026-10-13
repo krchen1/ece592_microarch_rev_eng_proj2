@@ -15,6 +15,8 @@ gcc -O1 -o dmp_test dmp_test.c || exit 1       # build the measurement program
   echo "host: $(hostname)"                     # which lab machine
   echo "kernel: $(uname -r)"                   # kernel version
   echo "perf_event_paranoid: $(cat /proc/sys/kernel/perf_event_paranoid)"  # counter permission level
+  echo "pinned_cpu: $CPU"                      # which core this run was pinned to
+  echo "runs: $RUNS  trials: $TRIALS"          # other run params, for the record
   lscpu                                        # CPU model, caches, flags
 } > "$OUT/setup.txt" 2>&1                      # save everything (stderr included)
 

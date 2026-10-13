@@ -1,27 +1,27 @@
-cached median (C5) = 64 cyc, cold median (C2) = 264 cyc, threshold = 164.0 cyc
+cached median (C5) = 64 cyc, cold median (C2) = 248 cyc, threshold = 156.0 cyc
 
 condition     fast_frac              95% CI  med_cyc  med_L1miss  med_LLCmiss
-TEST              0.025       [0.024,0.026]      264          64           32
-C1_nonptr         0.025       [0.024,0.025]      264          64           32
-C2_notrain        0.025       [0.024,0.026]      264          64           32
-C3_neighbor       0.025       [0.024,0.026]      264          64           32
-C4_seq            0.875       [0.873,0.877]       64          36           29
-C5_deref          1.000       [1.000,1.000]       64          36            0
+TEST              0.026       [0.025,0.026]      248          64           32
+C1_nonptr         0.026       [0.025,0.027]      248          64           32
+C2_notrain        0.025       [0.024,0.026]      248          64           32
+C3_neighbor       0.025       [0.025,0.026]      244          64           32
+C4_seq            0.897       [0.896,0.898]       64          36           27
+C5_deref          1.000       [1.000,1.000]       64          35            0
 
 per-run fast fraction (rows = condition, cols = run):
                  run1    run2    run3    run4    run5
-TEST            0.022   0.025   0.025   0.024   0.027
-C1_nonptr       0.025   0.023   0.025   0.026   0.024
-C2_notrain      0.024   0.025   0.024   0.025   0.026
-C3_neighbor     0.024   0.027   0.024   0.024   0.025
-C4_seq          0.893   0.897   0.898   0.853   0.837
+TEST            0.026   0.026   0.026   0.025   0.025
+C1_nonptr       0.027   0.026   0.025   0.026   0.025
+C2_notrain      0.024   0.025   0.025   0.025   0.024
+C3_neighbor     0.024   0.026   0.028   0.027   0.023
+C4_seq          0.898   0.894   0.899   0.897   0.897
 C5_deref        1.000   1.000   1.000   1.000   1.000
 
 TEST vs controls (Mann-Whitney U on per-trial fast fraction, Cohen's d):
-  TEST vs C1_nonptr    p=0.276  d=0.00
-  TEST vs C2_notrain   p=0.634  d=-0.00
-  TEST vs C3_neighbor  p=0.58  d=-0.00
-  TEST vs C4_seq       p=1  d=-14.88
+  TEST vs C1_nonptr    p=0.738  d=-0.01
+  TEST vs C2_notrain   p=0.153  d=0.03
+  TEST vs C3_neighbor  p=0.59  d=0.00
+  TEST vs C4_seq       p=1  d=-21.98
 
 VERDICT:
   INSUFFICIENT / no DMP detected: TEST not reliably above controls in every run, and L1-miss counter disagrees

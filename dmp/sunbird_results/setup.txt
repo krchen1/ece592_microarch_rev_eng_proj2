@@ -1,7 +1,9 @@
-date: 2026-10-12T22:41:02-04:00
+date: 2026-10-13T09:51:26-04:00
 host: sunbird.ece.ncsu.edu
 kernel: 5.14.0-611.54.1.el9_7.x86_64
 perf_event_paranoid: 2
+pinned_cpu: 2
+runs: 5  trials: 1000
 Architecture:                            x86_64
 CPU op-mode(s):                          32-bit, 64-bit
 Address sizes:                           46 bits physical, 48 bits virtual
@@ -17,7 +19,7 @@ Thread(s) per core:                      1
 Core(s) per socket:                      12
 Socket(s):                               2
 Stepping:                                2
-CPU(s) scaling MHz:                      67%
+CPU(s) scaling MHz:                      58%
 CPU max MHz:                             2500.0000
 CPU min MHz:                             0.0000
 BogoMIPS:                                5000.30
