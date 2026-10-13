@@ -7,11 +7,48 @@
 #   python3 analyze_dmp.py results/raw_all.csv results
 
 import sys                                   # command line arguments and exit
+import math                                  # erf for the normal-approximation p-value
 import numpy as np                           # array math
 import matplotlib                            # plotting backend selection
 matplotlib.use("Agg")                        # render to files, no display needed on lab machines
 import matplotlib.pyplot as plt              # plotting API
-from scipy.stats import mannwhitneyu         # non-parametric two-sample test
+
+
+def mannwhitneyu_greater(a, b):
+    """One-sided Mann-Whitney U p-value (alternative="greater": a tends to exceed b).
+
+    Dependency-free replacement for scipy.stats.mannwhitneyu: ranks the pooled
+    sample, averages tied ranks, then uses the normal approximation (with a tie
+    correction) for the p-value. Matches scipy's default (normal-approximation,
+    continuity-corrected) behavior closely enough for this analysis's needs.
+    """
+    n1, n2 = len(a), len(b)                                   # sample sizes
+    pooled = np.concatenate([a, b])                           # combined sample
+    order = np.argsort(pooled, kind="mergesort")              # stable sort for ties
+    ranks = np.empty(len(pooled), dtype=np.float64)           # rank of each element (1-based)
+    sorted_vals = pooled[order]
+    i = 0
+    while i < len(sorted_vals):                               # average ranks across tie groups
+        j = i
+        while j < len(sorted_vals) and sorted_vals[j] == sorted_vals[i]:
+            j += 1
+        avg_rank = (i + 1 + j) / 2.0                          # mean of 1-based ranks i+1..j
+        ranks[order[i:j]] = avg_rank
+        i = j
+    r1 = ranks[:n1].sum()                                     # rank sum of group a
+    u1 = r1 - n1 * (n1 + 1) / 2.0                             # U statistic for a > b
+
+    # tie correction term for the variance (Mann-Whitney normal approximation)
+    _, counts = np.unique(sorted_vals, return_counts=True)
+    tie_term = np.sum(counts ** 3 - counts)
+    n = n1 + n2
+    mu = n1 * n2 / 2.0
+    sigma2 = n1 * n2 / 12.0 * ((n + 1) - tie_term / (n * (n - 1))) if n > 1 else 0.0
+    sigma = math.sqrt(sigma2) if sigma2 > 0 else 1e-12
+
+    z = (u1 - mu - 0.5) / sigma                               # continuity-corrected z (one-sided, "greater")
+    p = 0.5 * math.erfc(z / math.sqrt(2.0))                    # P(Z >= z) via complementary error function
+    return min(max(p, 0.0), 1.0)
 
 NAMES = ["TEST", "C1_nonptr", "C2_notrain", "C3_neighbor", "C4_seq", "C5_deref"]  # cond id -> name
 TEST, NONPTR, NOTRAIN, NEIGHBOR, SEQ, DEREF = range(6)  # readable cond ids matching dmp_test.c
@@ -82,7 +119,7 @@ def main():
     print("\nTEST vs controls (Mann-Whitney U on per-trial fast fraction, Cohen's d):")  # significance
     for c in (NONPTR, NOTRAIN, NEIGHBOR, SEQ):                # compare TEST against each control
         a, b = res[TEST][1], res[c][1]                        # per-trial fast fractions
-        p = mannwhitneyu(a, b, alternative="greater").pvalue  # one-sided: TEST > control
+        p = mannwhitneyu_greater(a, b)                        # one-sided: TEST > control
         sd = np.sqrt((a.var() + b.var()) / 2.0) or 1e-9       # pooled std (avoid divide by zero)
         print(f"  TEST vs {NAMES[c]:<12} p={p:.3g}  d={(a.mean() - b.mean()) / sd:.2f}")
 
