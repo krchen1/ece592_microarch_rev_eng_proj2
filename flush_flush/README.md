@@ -1,2 +1,2 @@
-# Flush + Flush Frozen Thresholds for Each Machine
-Sunbird: 65 
+# Flush + Flush Frozen Thresholds, Core for Each Machine
+Sunbird: 65, 9
