@@ -10,3 +10,4 @@ Sorrow: N \
 Elevation: N \
 Descent: N \
 Greenforest: N \
+Seasidehill: N \
