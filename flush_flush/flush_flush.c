@@ -1,452 +1,497 @@
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>    //for time() to seed rand() in main
-#include <unistd.h>   // getpid()
+/* flush_flush_balanced.c */
 
-//tunable constants
-#define CACHE_LINE   64      /* bytes; probes must sit on separate lines. WHY 64? */
-#define NUM_SAMPLES  10000  /* repetitions for the calibration histogram */
-#define THRESHOLD 256 //placeholder until tested
+#include <stdint.h>   // fixed-width integer types (uint64_t etc.)
+#include <stdio.h>    // printf / fprintf for CSV + summaries
+#include <stdlib.h>   // posix_memalign, malloc, free, rand, srand, strtol, exit
+#include <string.h>   // memset to fault pages in, strcmp for mode dispatch
+#include <time.h>     // time() to seed rand(), clock_gettime() for wall time
+#include <unistd.h>   // getpid() to decorrelate the per-run seeds
+#include <math.h>     // log2() for the information-theoretic leakage rate (link with -lm)
+#include <sys/resource.h>   // getrusage() for peak resident memory (ru_maxrss)
 
-/* rdtsc_start(): read the timestamp counter to OPEN a timing window.
- * Return: the 64-bit counter value (combine the two 32-bit halves). */
-static inline uint64_t rdtsc_start(void)
-{
-    uint32_t lo; //will hold low the 32 bits of 64 bit counter
-    uint32_t hi; //will hold the high 32 bits of 64 bit counter
+/* ----- tunable constants ---------------------------------------------- */
+#define CACHE_LINE   64      /* bytes per cache line; probes must sit on separate lines */
+#define STRIDE       4096    /* one 4 KiB page between probe lines so they never share a line/prefetch stream */
+#define NUM_SAMPLES  10000   /* samples collected PER CLASS during calibration */
+
+/* ====================================================================== */
+/* Architecture-abstracted primitives: counter read, flush, and fences.   */
+/* Each target gets the same C-level API so the experiment code below is   */
+/* written once.                                                          */
+/* ====================================================================== */
+#if defined(__x86_64__)   /* ---- Intel + AMD path: TSC + clflush ------- */
+
+/* tsc_start(): read the Time-Stamp Counter to OPEN a timing window. */
+static inline uint64_t tsc_start(void)
+{   /* begin tsc_start */
+    uint32_t lo;   /* low 32 bits of the 64-bit counter */
+    uint32_t hi;   /* high 32 bits of the 64-bit counter */
     asm volatile (
-        "lfence\n\t"   /* wait for all EARLIER loads to finish, so work from
-                          before the timer can't bleed into the measurement */
-        "rdtsc\n\t"    /* read the 64-bit Time-Stamp Counter:
-                          hardware puts low 32 bits in EAX, high 32 bits in EDX */
-        : "=a"(lo),    /* output: tie EAX into lo   ("a" = eax/rax register) */
-          "=d"(hi)     /* output: tie EDX into hi   ("d" = edx/rdx register) */
+        "lfence\n\t"   /* drain earlier loads so pre-window work can't leak into the measurement */
+        "rdtsc\n\t"    /* read TSC: low 32 -> EAX, high 32 -> EDX */
+        : "=a"(lo),    /* output: EAX into lo */
+          "=d"(hi)     /* output: EDX into hi */
         :              /* no inputs */
-        : "memory"     /* clobber: compiler must not move memory ops across this */
+        : "memory"     /* clobber: forbid reordering memory ops across this */
     );
-    return ((uint64_t)hi << 32) | lo;
-    /* widen hi to 64 bits FIRST, then shift up by 32, then OR in lo.
-       widening before the shift is what stops the high bits falling off. */
-}
+    return ((uint64_t)hi << 32) | lo;   /* widen hi first, then shift+OR so no bits fall off */
+}   /* end tsc_start */
 
-// rdtsc_end(): read the TSC to CLOSE the window.
-static inline uint64_t rdtsc_end(void)
-{
-    uint32_t lo;   /* low  32 bits of the counter */
-    uint32_t hi;   /* high 32 bits of the counter */
-
+/* tsc_end(): read the TSC to CLOSE the window. */
+static inline uint64_t tsc_end(void)
+{   /* begin tsc_end */
+    uint32_t lo;   /* low 32 bits */
+    uint32_t hi;   /* high 32 bits */
     asm volatile (
-        "rdtscp\n\t"   //read TSC but wait for all earlier instructions to retire first
-        "lfence\n\t"   //stop later instructions from sneaking back before the clock read. On the end side of fence goes after.
-        : "=a"(lo),    //eas us ki
-          "=d"(hi)     //edx is high
-        :              
-        : "rcx", "memory"  //rdtscp writes ecx so we must declare rcx clobbered
+        "rdtscp\n\t"   /* read TSC only after all earlier instructions have retired */
+        "lfence\n\t"   /* stop later instructions from sliding back before the read */
+        : "=a"(lo),    /* EAX into lo */
+          "=d"(hi)     /* EDX into hi */
+        :              /* no inputs */
+        : "rcx", "memory"   /* rdtscp also writes ECX, so declare rcx clobbered */
     );
+    return ((uint64_t)hi << 32) | lo;   /* reassemble the 64-bit value */
+}   /* end tsc_end */
 
-    return ((uint64_t)hi << 32) | lo;   //same as rdtsc_start
-}
-
-// flush(addr): evict ONE line (the one containing addr) from the caches.
-static inline void flush(void *addr)
-{
+/* flush(addr): evict the one cache line containing addr from all levels. */
+static inline void flush(volatile void *addr)
+{   /* begin flush */
     asm volatile (
-        "clflush (%0)\n\t"   //evict the cache line containing addr from all levels. %0 means memory at address in oeprand 0.
-        :                    //no outputs
-        : "r"(addr)          //input 0: addr, placed in any general register. r = any register the compiler picks
-        : "memory"           //this changes memory state the compiler can't see so dont reorder anything across it
+        "clflush (%0)\n\t"   /* flush the line at the address in operand 0 */
+        :                    /* no outputs */
+        : "r"(addr)          /* input: addr in any general register */
+        : "memory"           /* memory state changes invisibly to the compiler */
     );
-}
-
-// clflush is weakly ordered on its own, so fence around it or the
-// timing read can slide in before the flush is actually done
-static inline void mfence(void)    // no args, no return
-{   // start of function body
-    asm volatile ("mfence\n\t" : : : "memory");   // full fence, nothing to wire up
-}   // end mfence
-
-static uint64_t time_flush(volatile uint8_t *addr)    // addr: line to flush+time, returns cycles elapsed
-{   // start of function body
-    uint64_t t0, t1;        // start/end tsc values
-
-    mfence();                // make sure nothing earlier is still in flight
-    t0 = rdtsc_start();      // start the clock
-
-    flush((void *)addr);    // do the actual flush
-    mfence();                 // and wait for it to land
-
-    t1 = rdtsc_end();        // stop the clock
-    return t1 - t0;           // cycles the flush took -- small = was cached, big = wasn't
-}   // end time_flush
-
-
-
-#define NUM_SECRETS 16    // how many candidate lines we're guessing between
-#define STRIDE 4096        // one page apart so each probe line is its own page
-
-static int probe_order[NUM_SECRETS];             // current shuffled scan order
-static void init_probe_order(void);              // fills/shuffles probe_order, defined near the bottom
-static void shuffle_order(int *order, int n);     // generic shuffle, also defined near the bottom
-
-static void victim(volatile uint8_t *table, int secret)    // table: shared buffer, secret: which line to touch
-{   // start of function body
-    (void)table[secret * STRIDE];   // just touch the one line, that's the whole "secret access"
-}   // end victim
-
-// sorts values in place and returns the middle element. for n=10000 this
-// isn't a textbook median (even n, no averaging the two middle values) but
-// it's close enough for picking a threshold
-static uint64_t median_of(uint64_t *values, int n)    // values gets sorted as a side effect
-{   // start of function body
-    for (int i = 1; i < n; i++) {           // insertion sort, i walks the unsorted part
-        uint64_t key = values[i];            // value being inserted
-        int j = i - 1;                        // walk left through the sorted part
-        while (j >= 0 && values[j] > key) {  // shift anything bigger than key to the right
-            values[j + 1] = values[j];          // slide it over
-            j--;                                  // keep walking left
-        }   // end while
-        values[j + 1] = key;    // key's final spot
-    }   // end for
-    return values[n / 2];   // middle-ish value once everything's sorted
-}   // end median_of
-
-// collects hit/miss cycle samples using the same table layout as the real
-// attack (NUM_SECRETS+1 lines, flush everything, shuffle the probe order)
-// instead of a single standalone page. tried calibrating against one page
-// early on and the threshold it gave was useless against the real table --
-// every probe read above it. table shape actually matters here.
-static void calibrate(void)    // prints "hit N"/"miss N" lines plus a suggested threshold
-{   // start of function body
-    srand((unsigned)time(NULL));   // seed once for this run
-
-    uint8_t *table;   // the probe table itself
-    if (posix_memalign((void **)&table, 4096, (size_t)(NUM_SECRETS + 1) * STRIDE) != 0) {   // grab aligned memory
-        perror("posix_memalign");   // couldn't get the memory
-        exit(1);                     // nothing to do without it
-    }   // end if
-    memset(table, 1, (size_t)(NUM_SECRETS + 1) * STRIDE);   // touch every page so it's actually mapped in
-
-    int flush_order[NUM_SECRETS + 1];   // shuffled order for the flush-all pass
-
-    uint64_t *hit_samples  = malloc(NUM_SAMPLES * sizeof(uint64_t));   // every hit sample this run
-    uint64_t *miss_samples = malloc(NUM_SAMPLES * sizeof(uint64_t));   // every miss sample this run
-    if (!hit_samples || !miss_samples) {   // either alloc failing means no threshold this time
-        perror("malloc");    // ran out of memory
-        exit(1);              // can't compute a threshold without the buffers
-    }   // end if
-
-    // run the loop a few thousand times before actually recording anything.
-    // the first chunk of samples read noticeably slower than steady state --
-    // probably clock ramping up, maybe some cache/TLB warmup too -- and that
-    // drags the median around if it's not burned off first. 500 wasn't
-    // enough, the median kept drifting down past that, so bumped it up.
-    #define CALIB_WARMUP_ITERS 3000   // how many throwaway iterations before recording starts
-    for (int w = 0; w < CALIB_WARMUP_ITERS; w++) {    // throwaway iterations, nothing recorded
-        init_probe_order();                             // fresh scan order
-        shuffle_order(flush_order, NUM_SECRETS + 1);    // fresh flush order
-
-        for (int j = 0; j <= NUM_SECRETS; j++)          // flush everything first
-            flush((void *)&table[flush_order[j] * STRIDE]);   // evict this line
-
-        int secret = rand() % NUM_SECRETS;   // pretend-victim line
-        victim(table, secret);                 // touch it
-
-        for (int k = 0; k < NUM_SECRETS; k++)          // scan everything, throw the timings away
-            (void)time_flush(&table[probe_order[k] * STRIDE]);   // time it and discard
-    }   // end warmup loop
-
-    for (int i = 0; i < NUM_SAMPLES; i++) {   // the real recorded iterations
-        init_probe_order();                          // fresh scan order, same as a real trial would use
-        shuffle_order(flush_order, NUM_SECRETS + 1);  // fresh flush order too
-
-        for (int j = 0; j <= NUM_SECRETS; j++)        // flush all 17 lines before touching anything
-            flush((void *)&table[flush_order[j] * STRIDE]);   // evict this line
-
-        int secret = rand() % NUM_SECRETS;   // this round's victim line
-        victim(table, secret);                 // one touch, like a real attack would see
-
-        // pick one of the 15 untouched lines at random to be this round's
-        // miss sample, instead of always using the same position
-        int miss_pick = rand() % (NUM_SECRETS - 1);   // which untouched line to keep
-        int miss_seen = 0;                               // counts untouched lines as we pass them
-        uint64_t hit_cycles = 0, miss_cycles = 0;        // this round's hit sample and chosen miss sample
-
-        for (int k = 0; k < NUM_SECRETS; k++) {   // scan every candidate
-            int idx = probe_order[k];                // which line this step is
-            uint64_t t = time_flush(&table[idx * STRIDE]);   // how long the flush took
-
-            if (idx == secret) {   // this is the line we touched
-                hit_cycles = t;   // keep it as the hit sample
-            } else {   // untouched line
-                if (miss_seen == miss_pick)   // is this the one we're keeping
-                    miss_cycles = t;   // this is the untouched line we're keeping
-                miss_seen++;             // move on to the next untouched candidate
-            }   // end else
-        }   // end for k
-
-        printf("hit %lu\n", hit_cycles);     // dump this round's hit sample
-        printf("miss %lu\n", miss_cycles);   // and its miss sample
-
-        hit_samples[i]  = hit_cycles;    // keep it around for the median/threshold math below
-        miss_samples[i] = miss_cycles;   // same for the miss side
-    }   // end for i
-
-    free(table);   // done with the table
-
-    // median_of sorts in place as a side effect, which is also handy for
-    // the misclassification count below
-    uint64_t hit_median  = median_of(hit_samples, NUM_SAMPLES);     // typical hit timing
-    uint64_t miss_median = median_of(miss_samples, NUM_SAMPLES);    // typical miss timing
-    int threshold = (int)((hit_median + miss_median) / 2);           // split the difference
-
-    // on this machine a cached line actually flushes FASTER than an
-    // uncached one, backwards from what most writeups assume. so "hit"
-    // means below the threshold here, not above.
-    uint32_t false_miss = 0;   // hit samples that would get called a miss at this threshold
-    for (int i = 0; i < NUM_SAMPLES; i++)   // walk every hit sample
-        if ((int)hit_samples[i] > threshold)   // reads above threshold, wrongly called miss
-            false_miss++;   // tally it
-
-    uint32_t false_hit = 0;    // miss samples that would get called a hit at this threshold
-    for (int i = 0; i < NUM_SAMPLES; i++)   // walk every miss sample
-        if ((int)miss_samples[i] <= threshold)   // reads at/below threshold, wrongly called hit
-            false_hit++;   // tally it
-
-    uint32_t misclassified = false_miss + false_hit;   // total errors, both directions
-
-    fprintf(stderr,   // summary goes to stderr
-        "calibration summary: suggested THRESHOLD=%d (midpoint of hit_median=%lu, miss_median=%lu) "   // first half of the message
-        "misclassified=%u/%d (%.2f%%)\n",   // second half, these concat into one string
-        threshold, hit_median, miss_median, misclassified, 2 * NUM_SAMPLES,   // the actual values
-        100.0 * misclassified / (2 * NUM_SAMPLES));   // and the percentage
-
-    free(hit_samples);    // cleanup
-    free(miss_samples);   // cleanup
-}   // end calibrate
-
-static int recover_one(volatile uint8_t *table, int secret)    // returns guessed index or -1
-{   // start of function body
-    for (int i = 0; i < NUM_SECRETS; i++)   // flush every candidate so we start uncached
-        flush((void *)&table[i * STRIDE]);   // evict this one
-
-    victim(table, secret);   // let the "victim" touch its line
-
-    // whichever line flushes faster than THRESHOLD is the one the victim touched
-    for (int i = 0; i < NUM_SECRETS; i++) {   // walk the shuffled scan order
-        int idx = probe_order[i];                        // which candidate this step checks
-        uint64_t t = time_flush(&table[idx * STRIDE]);   // how fast it flushed
-        if (t < THRESHOLD)   // fast enough to be the touched line
-            return idx;   // found it
-    }   // end for
-    return -1;   // nothing crossed the threshold
-}   // end recover_one
-
-// full measurement sweep for the writeup. table has 17 lines: 16 real
-// candidates plus one the victim never touches, used as a control to catch
-// false positives. the control gets probed at a random point in the scan
-// instead of always last so it isn't biased by being the final flush every
-// time. everything's timed in cycles via rdtsc for the per-trial latency
-// numbers.
-static int recover_one_measure(volatile uint8_t *table,   // shared buffer, NUM_SECRETS+1 lines
-                                int secret,                // line the victim should touch, ignored if run_victim is 0
-                                int run_victim,             // 1 = real trial, 0 = no-victim control trial
-                                uint64_t *probe_times,      // out: one cycle count per real line
-                                uint64_t *control_time,     // out: cycle count for the unrelated line
-                                int *control_hit,           // out: 1 if the control line read as a hit
-                                uint64_t *trial_cycles)     // out: cycles for the whole trial
-{   // start of function body
-    uint64_t t0 = rdtsc_start();   // start timing the whole trial
-
-    int flush_order[NUM_SECRETS + 1];           // shuffled order for the flush-all pass
-    shuffle_order(flush_order, NUM_SECRETS + 1);   // fresh every trial
-    for (int i = 0; i <= NUM_SECRETS; i++)         // flush all 16 candidates plus the control line
-        flush((void *)&table[flush_order[i] * STRIDE]);   // evict this one
-
-    if (run_victim)          // control trials skip this
-        victim(table, secret);   // touch the secret line
-
-    int probe_scan[NUM_SECRETS + 1];           // shuffled order for the probe pass
-    shuffle_order(probe_scan, NUM_SECRETS + 1);   // control's position moves around trial to trial
-
-    int guess = -1;   // first candidate that reads as a hit, or -1 if none do
-    for (int i = 0; i <= NUM_SECRETS; i++) {   // walk the shuffled scan
-        int idx = probe_scan[i];                        // which line this step checks
-        uint64_t t = time_flush(&table[idx * STRIDE]);   // how fast it flushed
-
-        if (idx == NUM_SECRETS) {   // this step is the control line
-            *control_time = t;                 // record the control line's own timing
-            *control_hit  = (t < THRESHOLD);   // did it wrongly read as a hit?
-        } else {   // this step is a real candidate
-            probe_times[idx] = t;             // keep every candidate's timing for the csv dump
-            if (t < THRESHOLD && guess == -1)   // first one crossing threshold wins
-                guess = idx;   // lock in the first one that crosses
-        }   // end else
-    }   // end for
-
-    uint64_t t1 = rdtsc_end();    // stop timing the trial
-    *trial_cycles = t1 - t0;      // hand back how long it took
-    return guess;                  // -1 if nothing crossed
-}   // end recover_one_measure
-
-static void print_probe_times(const uint64_t *probe_times)    // dumps all NUM_SECRETS timings, semicolon separated
-{   // start of function body
-    for (int i = 0; i < NUM_SECRETS; i++)   // dump each candidate's timing, semicolon separated
-        printf("%lu%s", probe_times[i], (i + 1 < NUM_SECRETS) ? ";" : "");   // no trailing separator on the last one
-}   // end print_probe_times
-
-// 10 runs of 10,000 trials each, plus 1000 no-victim control trials per run,
-// dumped as CSV on stdout with the per-run summary going to stderr so they
-// don't get mixed together (redirect with `./ff measure > data.csv`)
-static void measure(void)    // drives the full 10-run sweep
-{   // start of function body
-    const int RUNS             = 10;       // how many independent runs
-    const int TRIALS_PER_RUN   = 10000;    // real trials per run
-    const int CONTROL_TRIALS   = 1000;     // no-victim trials per run
-
-    uint64_t setup_t0 = rdtsc_start();   // time the one-time table setup
-    uint8_t *table;   // shared probe table for the whole sweep
-    if (posix_memalign((void **)&table, 4096, (size_t)(NUM_SECRETS + 1) * STRIDE) != 0) {   // allocate it
-        perror("posix_memalign");   // couldn't allocate the table
-        exit(1);                     // nothing else to do
-    }   // end if
-    memset(table, 1, (size_t)(NUM_SECRETS + 1) * STRIDE);   // map every page in up front
-    uint64_t setup_t1 = rdtsc_end();                 // stop timing setup
-    uint64_t setup_cycles = setup_t1 - setup_t0;     // how long setup took
-
-    size_t mem_bytes = (size_t)(NUM_SECRETS + 1) * STRIDE;   // table size, for the header row
-
-    printf("# setup_cycles=%lu mem_bytes=%zu threshold=%d\n", setup_cycles, mem_bytes, THRESHOLD);   // one-time metadata line
-    printf("run,trial_type,trial_id,secret,guess,correct,control_hit,trial_cycles,probe_times\n");    // csv header
-
-    for (int run = 0; run < RUNS; run++) {   // one pass of this loop per run
-        srand((unsigned)time(NULL) + (unsigned)run * 7919u + (unsigned)getpid());   // fresh seed each run
-
-        int correct = 0, false_negatives = 0;   // tallies for this run
-
-        struct timespec wall0, wall1;              // wall clock bounds for the real trials
-        clock_gettime(CLOCK_MONOTONIC, &wall0);   // start the wall clock
-
-        for (int t = 0; t < TRIALS_PER_RUN; t++) {   // the real trials
-            int secret = rand() % NUM_SECRETS;   // this trial's victim line
-            uint64_t probe_times[NUM_SECRETS], control_time, trial_cycles;   // out params from recover_one_measure
-            int control_hit;                                                   // same
-            int guess = recover_one_measure(table, secret, 1,   // run_victim=1, real trial
-                                             probe_times, &control_time, &control_hit, &trial_cycles);   // run the trial
-            int correct_flag = (guess == secret);   // did we get it right
-            correct += correct_flag;                  // tally it
-            if (guess == -1)   // nothing ever crossed threshold
-                false_negatives++;   // touched a line but never detected a hit
-
-            printf("%d,real,%d,%d,%d,%d,%d,%lu,", run, t, secret, guess, correct_flag,   // identifying + outcome fields
-                   control_hit, trial_cycles);   // identifying + outcome fields for this row
-            print_probe_times(probe_times);        // all 16 candidate timings
-            printf("\n");                              // end the row
-        }   // end real trial loop
-
-        clock_gettime(CLOCK_MONOTONIC, &wall1);   // stop the wall clock
-        double wall_sec = (double)(wall1.tv_sec - wall0.tv_sec)      // seconds spent on real trials
-                         + (double)(wall1.tv_nsec - wall0.tv_nsec) / 1e9;   // plus the fractional part
-
-        int false_positives = 0, control_line_violations = 0;   // tallies for the control trials
-        for (int t = 0; t < CONTROL_TRIALS; t++) {   // the no-victim control trials
-            uint64_t probe_times[NUM_SECRETS], control_time, trial_cycles;   // out params again
-            int control_hit;                                                   // same
-            int guess = recover_one_measure(table, -1, 0,   // run_victim=0, no secret for a control trial
-                                             probe_times, &control_time, &control_hit, &trial_cycles);   // run the control trial
-            if (guess != -1)   // claimed a hit even though nothing was touched
-                false_positives++;   // claimed a hit with nothing touched
-            if (control_hit)   // the unrelated line itself read as a hit
-                control_line_violations++;   // the control line itself misread as a hit
-
-            printf("%d,control,%d,%d,%d,%d,%d,%lu,", run, t, -1, guess, 0,   // secret is n/a, correct is always 0
-                   control_hit, trial_cycles);   // same row format, secret is n/a here
-            print_probe_times(probe_times);   // same timings dump
-            printf("\n");   // end the row
-        }   // end control trial loop
-
-        double accuracy     = 100.0 * correct / TRIALS_PER_RUN;              // % of real trials recovered right
-        double fn_rate       = 100.0 * false_negatives / TRIALS_PER_RUN;      // % with no hit detected at all
-        double fp_rate        = 100.0 * false_positives / CONTROL_TRIALS;      // % of control trials that still "hit"
-        double trials_per_sec = TRIALS_PER_RUN / wall_sec;                     // throughput
-        double bits_per_sec   = (correct * 4.0) / wall_sec;   // log2(16) bits per correct guess
-
-        fprintf(stderr,   // per-run summary goes to stderr, stdout stays pure csv
-            "run %d summary: accuracy=%.2f%% fn_rate=%.2f%% fp_rate=%.2f%% "   // first chunk of the message
-            "trials_per_sec=%.1f bits_per_sec=%.1f control_line_violations=%d/%d "   // middle chunk
-            "setup_cycles=%lu mem_bytes=%zu wall_sec=%.4f\n",   // last chunk, all concat together
-            run, accuracy, fn_rate, fp_rate, trials_per_sec, bits_per_sec,   // the main numbers
-            control_line_violations, CONTROL_TRIALS, setup_cycles, mem_bytes, wall_sec);   // the rest
-    }   // end run loop
-
-    free(table);   // all done
-}   // end measure
-
-int main(int argc, char **argv)    // argv[1] picks the mode
-{   // start of function body
-    if (argc < 2) {   // no mode given
-        fprintf(stderr, "usage: %s calibrate|attack|measure\n", argv[0]);   // print usage
-        return 1;                                                              // bail
-    }   // end if
-
-    if (strcmp(argv[1], "calibrate") == 0) {   // mode is calibrate
-        calibrate();     // runs the calibration sweep, prints hit/miss samples + a suggested threshold
-        return 0;          // done
-    }   // end if
-
-    if (strcmp(argv[1], "attack") == 0) {   // mode is attack
-        uint8_t *table;   // probe table for this run
-        if (posix_memalign((void **)&table, 4096, (size_t)NUM_SECRETS * STRIDE) != 0) {   // allocate it
-            perror("posix_memalign");   // couldn't allocate it
-            return 1;                     // nothing allocated yet, just bail
-        }   // end if
-        memset(table, 1, (size_t)NUM_SECRETS * STRIDE);   // map it in
-
-        srand((unsigned)time(NULL));   // seed for this run
-        init_probe_order();              // build the first scan order
-
-        int trials = 1000;   // how many secrets to try
-        int correct = 0;       // how many we got right
-
-        for (int t = 0; t < trials; t++) {   // run the trials
-            int secret = rand() % NUM_SECRETS;       // pick a secret
-            int guess  = recover_one(table, secret);   // try to recover it
-            if (guess == secret)   // got it right
-                correct++;   // got it
-        }   // end for
-
-        printf("accuracy: %d/%d = %.1f%%\n", correct, trials, 100.0 * correct / trials);   // final tally
-
-        free(table);   // cleanup
-        return 0;        // done
-    }   // end if
-
-    if (strcmp(argv[1], "measure") == 0) {   // mode is measure
-        measure();    // runs the full 10x10000 sweep described above
-        return 0;       // done
-    }   // end if
-
-    fprintf(stderr, "unknown mode: %s\n", argv[1]);   // didn't match any of the three modes
-    return 1;                                            // bail
-}   // end main
-
-// fisher-yates. used both for the probe scan order and the flush-all
-// preamble so neither one walks the table in address order
-static void shuffle_order(int *order, int n)    // order: array to fill, n: how many slots
-{   // start of function body
-    for (int i = 0; i < n; i++)   // start off as identity
-        order[i] = i;   // identity mapping before the shuffle
-
-    for (int i = n - 1; i > 0; i--) {   // walk backwards, swapping each slot with an earlier random one
-        int j = rand() % (i + 1);        // pick the swap partner
-        int tmp = order[i];                // standard swap
-        order[i] = order[j];               // first half of the swap
-        order[j] = tmp;                     // second half of the swap
-    }   // end for
-}   // end shuffle_order
-
-static void init_probe_order(void)    // fills/shuffles the file-scope probe_order array
-{   // start of function body
-    shuffle_order(probe_order, NUM_SECRETS);   // just hands off to the generic shuffle
-}   // end init_probe_order
+}   /* end flush */
+
+/* fence_full(): full barrier so the flush actually lands before we time it. */
+static inline void fence_full(void)
+{   /* begin fence_full */
+    asm volatile ("mfence\n\t" : : : "memory");   /* serialize all loads+stores */
+}   /* end fence_full */
+
+#define ARCH_NAME "x86_64"   /* label emitted in the CSV header */
+
+#elif defined(__aarch64__)   /* ---- ARM Neoverse N1 path ---------------- */
+
+/* tsc_start(): read a monotonic counter to OPEN the timing window. */
+static inline uint64_t tsc_start(void)
+{   /* begin tsc_start */
+    uint64_t v;   /* holds the 64-bit counter value */
+#ifdef USE_PMCCNTR   /* optional cycle-accurate path, needs userspace PMU access enabled */
+    asm volatile (
+        "isb\n\t"                 /* flush the pipeline so the read samples at a defined point */
+        "mrs %0, pmccntr_el0\n\t"  /* read the cycle counter (fine resolution) */
+        "isb\n\t"                 /* block later instructions from being sampled early */
+        : "=r"(v) : : "memory"
+    );
+#else                /* default portable path: virtual count register, EL0-readable on Linux */
+    asm volatile (
+        "isb\n\t"                 /* serialize before sampling the counter */
+        "mrs %0, cntvct_el0\n\t"   /* read the virtual counter (COARSE: ~tens of MHz tick) */
+        "isb\n\t"                 /* serialize after */
+        : "=r"(v) : : "memory"
+    );
+#endif
+    return v;   /* hand back the counter value */
+}   /* end tsc_start */
+
+/* tsc_end(): read the same counter to CLOSE the window. */
+static inline uint64_t tsc_end(void)
+{   /* begin tsc_end */
+    uint64_t v;   /* counter value */
+#ifdef USE_PMCCNTR   /* match whichever counter tsc_start used */
+    asm volatile (
+        "isb\n\t"                 /* make sure the flush has retired before we read */
+        "mrs %0, pmccntr_el0\n\t"  /* read the cycle counter */
+        "isb\n\t"                 /* serialize after */
+        : "=r"(v) : : "memory"
+    );
+#else
+    asm volatile (
+        "isb\n\t"                 /* serialize before */
+        "mrs %0, cntvct_el0\n\t"   /* read the virtual counter */
+        "isb\n\t"                 /* serialize after */
+        : "=r"(v) : : "memory"
+    );
+#endif
+    return v;   /* hand back the counter value */
+}   /* end tsc_end */
+
+/* flush(addr): clean+invalidate the line containing addr to the point of coherency. */
+static inline void flush(volatile void *addr)
+{   /* begin flush */
+    asm volatile (
+        "dc civac, %0\n\t"   /* Data Cache Clean & Invalidate by VA to PoC (EL0 needs SCTLR_EL1.UCI, set by Linux) */
+        :                    /* no outputs */
+        : "r"(addr)          /* input: the virtual address */
+        : "memory"           /* cache state changes invisibly to the compiler */
+    );
+}   /* end flush */
+
+/* fence_full(): full data barrier so DC CIVAC completes before timing. */
+static inline void fence_full(void)
+{   /* begin fence_full */
+    asm volatile ("dsb ish\n\t" "isb\n\t" : : : "memory");   /* drain to inner-shareable, then flush pipeline */
+}   /* end fence_full */
+
+#define ARCH_NAME "aarch64"   /* label emitted in the CSV header */
+
+#else   /* ---- any other architecture is unsupported ------------------- */
+#error "unsupported architecture: need x86_64 (clflush/rdtsc) or aarch64 (dc civac/cntvct)"
+#endif  /* architecture select */
+
+/* time_flush(addr): fenced measurement of how long it takes to flush addr. */
+static uint64_t time_flush(volatile uint8_t *addr)
+{   /* begin time_flush */
+    uint64_t t0, t1;         /* start/end counter readings */
+    fence_full();            /* make sure nothing earlier is still in flight */
+    t0 = tsc_start();        /* open the timing window */
+    flush((void *)addr);     /* the operation we are timing */
+    fence_full();            /* wait for the flush to actually land */
+    t1 = tsc_end();          /* close the timing window */
+    return t1 - t0;          /* elapsed counter ticks for this flush */
+}   /* end time_flush */
+
+/* ====================================================================== */
+/* Shared helpers: table layout, victim touch, median, shuffle.           */
+/* ====================================================================== */
+
+/* Two class positions in the table: line 0 is the one we (maybe) touch,   */
+/* line 1 is a never-touched control used to balance the layout.           */
+#define NUM_LINES 2   /* how many distinct probe lines the table holds */
+
+/* victim(table, line): perform the single "secret" memory access. */
+static void victim(volatile uint8_t *table, int line)
+{   /* begin victim */
+    (void)table[line * STRIDE];   /* one touch of the chosen line pulls it into cache */
+}   /* end victim */
+
+/* median_of(): insertion-sort in place and return the middle element. */
+static uint64_t median_of(uint64_t *values, int n)
+{   /* begin median_of */
+    for (int i = 1; i < n; i++) {           /* i walks the unsorted tail */
+        uint64_t key = values[i];            /* value being inserted into the sorted head */
+        int j = i - 1;                        /* scan leftward through the sorted head */
+        while (j >= 0 && values[j] > key) {  /* shift anything larger than key one slot right */
+            values[j + 1] = values[j];          /* slide it over */
+            j--;                                  /* keep walking left */
+        }   /* end while */
+        values[j + 1] = key;                 /* drop key into its sorted slot */
+    }   /* end for */
+    return values[n / 2];   /* middle-ish element once sorted (good enough for a threshold) */
+}   /* end median_of */
+
+/* shuffle_order(): Fisher-Yates shuffle of order[0..n-1]. */
+static void shuffle_order(int *order, int n)
+{   /* begin shuffle_order */
+    for (int i = n - 1; i > 0; i--) {   /* walk from the end, swapping each slot with an earlier random one */
+        int j = rand() % (i + 1);        /* pick the swap partner in [0, i] */
+        int tmp = order[i];               /* standard three-way swap */
+        order[i] = order[j];              /* first half of the swap */
+        order[j] = tmp;                    /* second half of the swap */
+    }   /* end for */
+}   /* end shuffle_order */
+
+/* alloc_table(): allocate+map the page-aligned probe table, or die. */
+static uint8_t *alloc_table(void)
+{   /* begin alloc_table */
+    uint8_t *table;   /* pointer to the allocated buffer */
+    if (posix_memalign((void **)&table, 4096, (size_t)NUM_LINES * STRIDE) != 0) {   /* page-aligned alloc */
+        perror("posix_memalign");   /* report why it failed */
+        exit(1);                     /* no table, nothing to do */
+    }   /* end if */
+    memset(table, 1, (size_t)NUM_LINES * STRIDE);   /* write every page so it is actually faulted in */
+    return table;   /* hand back the ready-to-use table */
+}   /* end alloc_table */
+
+/* class labels used by both calibration and measurement */
+#define LABEL_MISS 0   /* line was NOT touched before we flush+time it */
+#define LABEL_HIT  1   /* line WAS touched (cached) before we flush+time it */
+
+/* warmup iterations burned before recording, to get past clock ramp /    */
+/* cache+TLB warmup that otherwise drags the early samples slower.         */
+#define CALIB_WARMUP_ITERS 3000   /* throwaway iterations before calibration records anything */
+#define MEASURE_WARMUP_ITERS 3000   /* throwaway iterations before the measure runs, same purpose as calib warmup */
+
+/* ====================================================================== */
+/* calibrate -> 10000 hit + 10000 miss samples, suggest threshold */
+/* ====================================================================== */
+static void calibrate(void)
+{   /* begin calibrate */
+    srand((unsigned)time(NULL));   /* seed the RNG once for this calibration run */
+
+    uint8_t *table = alloc_table();   /* same table shape the measure path uses, so the threshold transfers */
+
+    uint64_t *hit_samples  = malloc(NUM_SAMPLES * sizeof(uint64_t));   /* buffer for the hit class */
+    uint64_t *miss_samples = malloc(NUM_SAMPLES * sizeof(uint64_t));   /* buffer for the miss class */
+    if (!hit_samples || !miss_samples) {   /* either allocation failing means no calibration */
+        perror("malloc");   /* report the failure */
+        exit(1);             /* cannot continue without the buffers */
+    }   /* end if */
+
+    for (int w = 0; w < CALIB_WARMUP_ITERS; w++) {   /* warmup: identical work, but discard the timings */
+        flush((volatile uint8_t *)&table[0 * STRIDE]);   /* evict the probe line */
+        fence_full();                                     /* make sure the flush landed */
+        victim(table, 0);                                 /* touch it so the warmup mirrors a hit trial */
+        (void)time_flush(&table[0 * STRIDE]);             /* time and throw the result away */
+    }   /* end warmup loop */
+
+    for (int i = 0; i < NUM_SAMPLES; i++) {   /* collect one HIT sample per iteration */
+        flush((volatile uint8_t *)&table[0 * STRIDE]);   /* start from an evicted (uncached) line */
+        fence_full();                                     /* ensure the eviction completed */
+        victim(table, 0);                                 /* touch the line so it is now cached */
+        uint64_t t = time_flush(&table[0 * STRIDE]);      /* time the flush of the cached line */
+        hit_samples[i] = t;                               /* record the hit-class sample */
+        printf("hit %lu\n", (unsigned long)t);            /* emit it (compatible with the analyzer) */
+    }   /* end hit loop */
+
+    for (int i = 0; i < NUM_SAMPLES; i++) {   /* collect one MISS sample per iteration */
+        flush((volatile uint8_t *)&table[0 * STRIDE]);   /* evict the line */
+        fence_full();                                     /* ensure the eviction completed */
+        /* deliberately do NOT touch the line, so it stays uncached */
+        uint64_t t = time_flush(&table[0 * STRIDE]);      /* time the flush of the uncached line */
+        miss_samples[i] = t;                              /* record the miss-class sample */
+        printf("miss %lu\n", (unsigned long)t);           /* emit it (compatible with the analyzer) */
+    }   /* end miss loop */
+
+    free(table);   /* done with the probe table */
+
+    uint64_t hit_median  = median_of(hit_samples, NUM_SAMPLES);    /* typical hit timing (sorts in place) */
+    uint64_t miss_median = median_of(miss_samples, NUM_SAMPLES);   /* typical miss timing (sorts in place) */
+    int threshold = (int)((hit_median + miss_median) / 2);          /* freeze the midpoint between the classes */
+
+    /* Polarity is derived, not assumed: on some parts a cached line flushes
+     * SLOWER (hit above threshold), on others FASTER (hit below). Pick the
+     * side the hit median actually sits on. */
+    const char *polarity = (hit_median > miss_median) ? "above" : "below";   /* "above" => hit when timing > T */
+
+    uint32_t misclassified = 0;   /* count samples the frozen threshold would get wrong */
+    for (int i = 0; i < NUM_SAMPLES; i++) {   /* check every hit sample */
+        int pred_hit = (hit_median > miss_median) ? ((int)hit_samples[i] > threshold)   /* classify with the chosen polarity */
+                                                   : ((int)hit_samples[i] < threshold);
+        if (!pred_hit) misclassified++;   /* a hit sample classified as miss is an error */
+    }   /* end hit check */
+    for (int i = 0; i < NUM_SAMPLES; i++) {   /* check every miss sample */
+        int pred_hit = (hit_median > miss_median) ? ((int)miss_samples[i] > threshold)   /* same polarity rule */
+                                                   : ((int)miss_samples[i] < threshold);
+        if (pred_hit) misclassified++;   /* a miss sample classified as hit is an error */
+    }   /* end miss check */
+
+    fprintf(stderr,   /* frozen-threshold summary goes to stderr so stdout stays pure samples */
+        "FROZEN threshold=%d polarity=%s hit_median=%lu miss_median=%lu "
+        "misclassified=%u/%d (%.2f%%)\n",
+        threshold, polarity, (unsigned long)hit_median, (unsigned long)miss_median,
+        misclassified, 2 * NUM_SAMPLES, 100.0 * misclassified / (2 * NUM_SAMPLES));   /* the numbers */
+
+    free(hit_samples);    /* cleanup */
+    free(miss_samples);   /* cleanup */
+}   /* end calibrate */
+
+/* mi_bits(): mutual information I(label;prediction) in bits/trial, derived  */
+/* from the 2x2 confusion matrix. This is the true LEAKAGE per trial of a    */
+/* noisy binary channel: 1.0 bit means a perfect oracle, 0.0 means the       */
+/* prediction tells you nothing about the secret. Zero-count cells contribute */
+/* nothing (0*log0 == 0 by convention). */
+static double mi_bits(uint64_t tp, uint64_t tn, uint64_t fp, uint64_t fn)
+{   /* begin mi_bits */
+    double n = (double)(tp + tn + fp + fn);   /* total trials */
+    if (n == 0.0) return 0.0;                   /* no data => no information */
+
+    double px_hit  = (double)(tp + fn) / n;   /* P(label=hit) */
+    double px_miss = (double)(fp + tn) / n;   /* P(label=miss) */
+    double py_hit  = (double)(tp + fp) / n;   /* P(pred=hit) */
+    double py_miss = (double)(fn + tn) / n;   /* P(pred=miss) */
+
+    double cells[4] = { (double)tp, (double)fn, (double)fp, (double)tn };   /* joint counts */
+    double px[4]    = { px_hit, px_hit, px_miss, px_miss };                  /* matching P(label) per cell */
+    double py[4]    = { py_hit, py_miss, py_hit, py_miss };                  /* matching P(pred)  per cell */
+
+    double mi = 0.0;   /* accumulated mutual information */
+    for (int c = 0; c < 4; c++) {   /* sum over the four confusion cells */
+        if (cells[c] == 0.0) continue;         /* skip empty cells (0*log0 == 0) */
+        double pxy = cells[c] / n;              /* joint probability P(label,pred) */
+        double denom = px[c] * py[c];           /* independence baseline P(label)P(pred) */
+        if (denom > 0.0)                        /* guard against a zero marginal */
+            mi += pxy * log2(pxy / denom);      /* this cell's contribution to I(X;Y) */
+    }   /* end for */
+    return mi;   /* bits of information leaked per trial */
+}   /* end mi_bits */
+
+/* ====================================================================== */
+/* measure -> 10 runs x 10000 fresh balanced trials, frozen T.    */
+/* Collects, per run: leakage rate, accuracy, false pos/neg, latency,     */
+/* one-time setup cost, and memory use.                                   */
+/* ====================================================================== */
+static void measure(int threshold, int hit_above)
+{   /* begin measure (hit_above: 1 => predict hit when timing > T, else <) */
+    const int RUNS           = 10;      /* independent runs */
+    const int TRIALS_PER_RUN = 10000;   /* trials per run */
+    const int HALF           = TRIALS_PER_RUN / 2;   /* 5000 hits + 5000 misses => balanced */
+
+    /* ---- setup cost: time the one-time table allocation + fault-in ---- */
+    uint64_t setup_t0 = tsc_start();   /* counter before setup */
+    uint8_t *table = alloc_table();     /* allocate + memset (maps every page) the probe table */
+    uint64_t setup_t1 = tsc_end();     /* counter after setup */
+    uint64_t setup_cycles = setup_t1 - setup_t0;   /* cycles/ticks spent building the attack buffer */
+
+    int *labels = malloc(TRIALS_PER_RUN * sizeof(int));   /* this run's shuffled hit/miss labels */
+    uint64_t *trial_lat = malloc(TRIALS_PER_RUN * sizeof(uint64_t));   /* per-trial latency, kept for median */
+    if (!labels || !trial_lat) {   /* allocation guard */
+        perror("malloc");   /* report */
+        exit(1);             /* error */
+    }   /* end if */
+
+    /* ---- memory use: the side-channel working set + harness buffers ---- */
+    size_t probe_bytes  = (size_t)NUM_LINES * STRIDE;            /* the meaningful attack footprint */
+    size_t labels_bytes = (size_t)TRIALS_PER_RUN * sizeof(int);  /* label bookkeeping */
+    size_t lat_bytes    = (size_t)TRIALS_PER_RUN * sizeof(uint64_t);   /* latency bookkeeping */
+
+    printf("# arch=%s threshold=%d polarity=%s trials_per_run=%d runs=%d "   /* one-time metadata line */
+           "setup_cycles=%lu probe_bytes=%zu labels_bytes=%zu lat_bytes=%zu\n",
+           ARCH_NAME, threshold, hit_above ? "above" : "below", TRIALS_PER_RUN, RUNS,
+           (unsigned long)setup_cycles, probe_bytes, labels_bytes, lat_bytes);
+    printf("run,trial_id,label,timing,trial_cycles,predicted,correct\n");   /* CSV header (adds per-trial latency) */
+
+    /* ---- warmup: burn throwaway trials so first run isn't measured cold*/
+    for (int w = 0; w < MEASURE_WARMUP_ITERS; w++) {   /* throwaway iterations, nothing recorded */
+        flush((volatile uint8_t *)&table[0 * STRIDE]);   /* always start from an evicted line, as a trial does */
+        fence_full();                                     /* ensure the eviction completed */
+        victim(table, 0);                                 /* touch it so the warmup mirrors a hit trial */
+        (void)time_flush(&table[0 * STRIDE]);             /* time the probe and throw the result away */
+    }   /* end warmup loop */
+
+    for (int run = 0; run < RUNS; run++) {   /* one pass per run */
+        srand((unsigned)time(NULL) + (unsigned)run * 7919u + (unsigned)getpid());   /* fresh seed => fresh trials */
+
+        for (int i = 0; i < TRIALS_PER_RUN; i++)              /* build a balanced label array */
+            labels[i] = (i < HALF) ? LABEL_HIT : LABEL_MISS;   /* first half hits, second half misses */
+        shuffle_order(labels, TRIALS_PER_RUN);                 /* shuffle so hits/misses interleave randomly */
+
+        uint64_t tp = 0, tn = 0, fp = 0, fn = 0;   /* confusion-matrix counters for this run */
+        uint64_t lat_sum = 0;                       /* running sum of per-trial latency for the mean */
+        uint64_t lat_min = UINT64_MAX, lat_max = 0; /* extremes of per-trial latency */
+
+        struct timespec wall0, wall1;              /* wall-clock bounds for throughput */
+        clock_gettime(CLOCK_MONOTONIC, &wall0);   /* start the wall clock */
+
+        for (int t = 0; t < TRIALS_PER_RUN; t++) {   /* run every trial */
+            int label = labels[t];                     /* what this trial's ground truth is */
+
+            uint64_t tt0 = tsc_start();                       /* start measuring THIS trial's latency */
+            flush((volatile uint8_t *)&table[0 * STRIDE]);   /* always start from an evicted line */
+            fence_full();                                     /* ensure the eviction completed */
+            if (label == LABEL_HIT)                           /* a hit trial touches the line first */
+                victim(table, 0);                              /* ...pulling it into cache */
+            uint64_t timing = time_flush(&table[0 * STRIDE]);   /* the measured flush time (the probe) */
+            uint64_t tt1 = tsc_end();                          /* stop measuring the trial */
+            uint64_t trial_cycles = tt1 - tt0;                 /* full cost of one probe = trial latency */
+
+            lat_sum += trial_cycles;                           /* accumulate for the mean */
+            if (trial_cycles < lat_min) lat_min = trial_cycles;   /* track the fastest trial */
+            if (trial_cycles > lat_max) lat_max = trial_cycles;   /* track the slowest trial */
+            trial_lat[t] = trial_cycles;                       /* stash for the per-run median */
+
+            int pred_hit = hit_above ? ((int)timing > threshold)   /* apply the FROZEN threshold with its polarity */
+                                     : ((int)timing < threshold);
+            int correct = (pred_hit == (label == LABEL_HIT));       /* did the prediction match ground truth? */
+
+            if (label == LABEL_HIT && pred_hit)       tp++;   /* true positive */
+            else if (label == LABEL_MISS && !pred_hit) tn++;  /* true negative */
+            else if (label == LABEL_MISS && pred_hit)  fp++;  /* false positive */
+            else                                       fn++;  /* false negative (hit predicted as miss) */
+
+            printf("%d,%d,%s,%lu,%lu,%s,%d\n",   /* emit this trial's CSV row (now with trial_cycles) */
+                   run, t, (label == LABEL_HIT) ? "hit" : "miss",
+                   (unsigned long)timing, (unsigned long)trial_cycles,
+                   pred_hit ? "hit" : "miss", correct);
+        }   /* end trial loop */
+
+        clock_gettime(CLOCK_MONOTONIC, &wall1);   /* stop the wall clock */
+        double wall_sec = (double)(wall1.tv_sec - wall0.tv_sec)      /* whole seconds */
+                        + (double)(wall1.tv_nsec - wall0.tv_nsec) / 1e9;   /* plus fractional part */
+
+        uint64_t total = tp + tn + fp + fn;   /* total trials (== TRIALS_PER_RUN) */
+
+        /* ---- accuracy + false positive/negative metrics ---- */
+        double accuracy  = 100.0 * (double)(tp + tn) / (double)total;   /* overall correct rate */
+        double tpr       = (tp + fn) ? 100.0 * (double)tp / (double)(tp + fn) : 0.0;   /* recall / sensitivity */
+        double fpr       = (fp + tn) ? 100.0 * (double)fp / (double)(fp + tn) : 0.0;   /* false-positive rate */
+        double fnr       = (tp + fn) ? 100.0 * (double)fn / (double)(tp + fn) : 0.0;   /* false-negative rate */
+        double precision = (tp + fp) ? 100.0 * (double)tp / (double)(tp + fp) : 0.0;   /* positive predictive value */
+        double f1        = (precision + tpr) ? 2.0 * precision * tpr / (precision + tpr) : 0.0;   /* harmonic mean */
+
+        /* ---- leakage rate (information-theoretic, not just correct-bit counting) ---- */
+        double bits_per_trial = mi_bits(tp, tn, fp, fn);   /* mutual information per trial */
+        double trials_ps      = total / wall_sec;           /* trial throughput */
+        double leak_bps       = bits_per_trial * trials_ps;  /* LEAKAGE RATE: bits of secret per second */
+
+        /* ---- latency: per-trial probe cost, in counter cycles/ticks ---- */
+        double lat_mean   = (double)lat_sum / (double)total;        /* mean trial latency */
+        uint64_t lat_med  = median_of(trial_lat, TRIALS_PER_RUN);   /* median trial latency (sorts in place) */
+
+        /* ---- memory use: process peak resident set (high-water mark) ---- */
+        struct rusage ru;                      /* holds resource-usage counters */
+        getrusage(RUSAGE_SELF, &ru);          /* query this process */
+        long max_rss_kb = ru.ru_maxrss;        /* peak resident set size, in KiB on Linux */
+
+        fprintf(stderr,   /* per-run summary to stderr so stdout stays pure CSV */
+            "run %d summary: "
+            "leak_bits_per_trial=%.4f leak_bits_per_sec=%.1f "          /* leakage rate */
+            "acc=%.2f%% tpr=%.2f%% fpr=%.2f%% fnr=%.2f%% prec=%.2f%% f1=%.2f "   /* accuracy + FP/FN rates */
+            "TP=%lu TN=%lu FP=%lu FN=%lu "                              /* raw false pos/neg counts */
+            "lat_cycles(mean/med/min/max)=%.1f/%lu/%lu/%lu "           /* per-trial latency */
+            "setup_cycles=%lu "                                         /* one-time setup cost */
+            "probe_bytes=%zu max_rss_kb=%ld "                           /* memory use */
+            "trials_per_sec=%.1f wall_sec=%.4f\n",                      /* throughput + wall time */
+            run,
+            bits_per_trial, leak_bps,
+            accuracy, tpr, fpr, fnr, precision, f1,
+            (unsigned long)tp, (unsigned long)tn, (unsigned long)fp, (unsigned long)fn,
+            lat_mean, (unsigned long)lat_med, (unsigned long)lat_min, (unsigned long)lat_max,
+            (unsigned long)setup_cycles,
+            probe_bytes, max_rss_kb,
+            trials_ps, wall_sec);   /* the numbers */
+    }   /* end run loop */
+
+    free(trial_lat);   /* cleanup */
+    free(labels);      /* cleanup */
+    free(table);       /* cleanup */
+}   /* end measure */
+
+/* ====================================================================== */
+/* main: dispatch on argv[1].                                             */
+/* ====================================================================== */
+int main(int argc, char **argv)
+{   /* begin main */
+    if (argc < 2) {   /* no mode supplied */
+        fprintf(stderr, "usage: %s calibrate\n", argv[0]);   /* show the calibrate form */
+        fprintf(stderr, "       %s measure <threshold> <below|above>\n", argv[0]);   /* and the measure form */
+        return 1;   /* error */
+    }   /* end if */
+
+    if (strcmp(argv[1], "calibrate") == 0) {   /* calibration mode */
+        calibrate();   /* collect samples + print a frozen threshold suggestion */
+        return 0;       /* done */
+    }   /* end if */
+
+    if (strcmp(argv[1], "measure") == 0) {   /* measurement mode */
+        if (argc < 4) {   /* measure needs the frozen threshold and its polarity */
+            fprintf(stderr, "usage: %s measure <threshold> <below|above>\n", argv[0]);   /* remind the caller */
+            return 1;   /* error */
+        }   /* end if */
+        int threshold = (int)strtol(argv[2], NULL, 10);   /* the FROZEN threshold from calibration */
+        int hit_above;   /* polarity: 1 => predict hit when timing > threshold */
+        if (strcmp(argv[3], "above") == 0)      hit_above = 1;   /* "above" polarity */
+        else if (strcmp(argv[3], "below") == 0) hit_above = 0;   /* "below" polarity */
+        else {   /* anything else is a usage error */
+            fprintf(stderr, "polarity must be 'below' or 'above'\n");   /* explain */
+            return 1;   /* error */
+        }   /* end else */
+        measure(threshold, hit_above);   /* run the 10x10000 balanced sweep */
+        return 0;   /* done */
+    }   /* end if */
+
+    fprintf(stderr, "unknown mode: %s\n", argv[1]);   /* did not match calibrate/measure */
+    return 1;   /* error */
+}   /* end main */

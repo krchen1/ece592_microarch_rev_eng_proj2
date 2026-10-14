@@ -10,14 +10,15 @@ Challenges of Reverse Engineering Cache, Future of Cache Organization, and End o
 ```htop```
 
 # Build (flush_flush example)
-```gcc -O0 -o flush_flush flush_flush.c```
+```cd flush_flush``` \
+```gcc -O0 -o ff flush_flush.c -lm```                  (x86) \
+```gcc -O0 -march=armv8-a -o ff flush_flush.c -lm```   (ARM) \
 
-# Calibrate (flush_flush example)
-```taskset -c 0 ./flush_flush calibrate > <machine>_calib.csv ```
+# Calibrate (frozen threshold + polarity printed to stderr):
+```taskset -c <core> ./ff calibrate > <machine>_calib.csv 2> <machine>_calib_summary.txt``` \
 
-# Run Attack
-```tasket -c <core> ./<attack> attack``` \
-```taskset -c <core> ./flush_flush measure > <machine>_measure_data.csv 2> <machine>_measure_summary.txt``` \
+# Measure Attack
+```taskset -c <core> ./ff measure <threshold> <below|above> > <machine>_measure_data.csv 2> <machine>_measure_summary.txt``` \
 
 # DMP Check
 ```cd dmp``` \
