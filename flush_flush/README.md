@@ -1,6 +1,6 @@
 # Flush + Flush Frozen Thresholds, Core for Each Machine
 Sunbird: 280, 7 \
-Charnwood: 73, 3 \ 
+Charnwood: 241, 7 \ 
 Ookay: 154, 5 \
 Upgrade: 149, 7 \
 Thunderbird: 4, 7 \

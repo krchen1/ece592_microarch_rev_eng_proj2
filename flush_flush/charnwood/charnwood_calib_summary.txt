@@ -1,0 +1,1 @@
+FROZEN threshold=241 polarity=above hit_median=340 miss_median=142 misclassified=3991/20000 (19.95%)
