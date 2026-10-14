@@ -8,3 +8,4 @@ Crux: N \
 Gravedigger: N \
 Sorrow: N \
 Elevation: N \
+Descent: N \
