@@ -1,0 +1,27 @@
+cached median (C5) = 28 cyc, cold median (C2) = 194 cyc, threshold = 111.0 cyc
+
+condition     fast_frac              95% CI  med_cyc  med_L1miss  med_LLCmiss
+TEST              0.062       [0.061,0.063]      194          32           85
+C1_nonptr         0.062       [0.061,0.064]      194          32           85
+C2_notrain        0.062       [0.061,0.063]      194          32           84
+C3_neighbor       0.063       [0.062,0.064]      194          32           84
+C4_seq            0.927       [0.926,0.928]       28           3           20
+C5_deref          1.000       [1.000,1.000]       28           0            0
+
+per-run fast fraction (rows = condition, cols = run):
+                 run1    run2    run3    run4    run5
+TEST            0.059   0.061   0.061   0.066   0.063
+C1_nonptr       0.063   0.062   0.061   0.063   0.064
+C2_notrain      0.062   0.065   0.063   0.060   0.060
+C3_neighbor     0.061   0.064   0.063   0.064   0.063
+C4_seq          0.923   0.929   0.928   0.928   0.928
+C5_deref        1.000   1.000   1.000   1.000   1.000
+
+TEST vs controls (Mann-Whitney U on per-trial fast fraction, Cohen's d):
+  TEST vs C1_nonptr    p=0.819  d=-0.01
+  TEST vs C2_notrain   p=0.677  d=-0.00
+  TEST vs C3_neighbor  p=0.927  d=-0.02
+  TEST vs C4_seq       p=1  d=-20.18
+
+VERDICT:
+  INSUFFICIENT / no DMP detected: TEST not reliably above controls in every run, and L1-miss counter disagrees

@@ -6,3 +6,4 @@ Upgrade: N \
 Artemisia: N \
 Crux: N \
 Gravedigger: N \
+Sorrow: N \
